@@ -40,6 +40,11 @@ SYNONYMS = {
 }
 
 def make_pubmed_term(q: str) -> str:
+    """
+    Convert long free-text into a less brittle PubMed term:
+    - quoted phrase fallback
+    - AND of up to 5 high-signal tokens in Title/Abstract
+    """
     q = (q or "").strip()
     if not q:
         return q
@@ -123,6 +128,7 @@ def build_context(hits):
 def generate_answer(question: str, hits, mode: str):
     client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
     context = build_context(hits)
+    allowed_pmids = [h["pmid"] for h in hits] if hits else []
 
     system = (
         "You are an emergency medicine attending helping another ED clinician on shift. "
@@ -130,9 +136,14 @@ def generate_answer(question: str, hits, mode: str):
         "Do not ask for or include PHI. "
         "If critical details are missing, ask up to 3 clarifying questions first, then give a best-effort answer. "
         "Only cite PMIDs that appear in the provided PubMed results list. "
-        "If you did not use a source, do not cite it."
+        "If the PubMed results list is non-empty, you MUST cite at least 1 PMID from it."
     )
 
+    pmid_rule = (
+        f"Allowed PMIDs: {', '.join(allowed_pmids) if allowed_pmids else 'none'}\n"
+        "RULE: If Allowed PMIDs is not 'none', you MUST end with 'Citations: ' followed by 1–3 PMIDs from Allowed PMIDs.\n"
+        "Do not write 'none' if Allowed PMIDs is not 'none'.\n"
+    )
 
     if mode == "Discharge instructions (patient-friendly)":
         user = f"""Question:
@@ -140,6 +151,8 @@ def generate_answer(question: str, hits, mode: str):
 
 PubMed results you may cite (do not invent citations beyond this list):
 {context}
+
+{pmid_rule}
 
 Write patient-friendly discharge instructions at about an 8th-grade reading level.
 Include: brief explanation, what to do at home, meds if relevant (general), red flags to return, follow-up.
@@ -154,12 +167,14 @@ End with: "This is not medical advice and is for demo only."
 PubMed results you may cite (do not invent citations beyond this list):
 {context}
 
+{pmid_rule}
+
 Output (keep brief):
 - Quick take (max 3 bullets)
 - Workup (labs/imaging) (max 6 bullets)
 - Treatment (max 6 bullets)
 - Disposition (max 4 bullets)
-- Citations: list PMIDs you used (or say "none")
+- Citations: 1–3 PMIDs (required if Allowed PMIDs is not 'none')
 """
         max_tokens = 450
 
