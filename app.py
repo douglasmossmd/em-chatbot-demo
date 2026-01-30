@@ -5,7 +5,7 @@ from openai import OpenAI
 
 st.set_page_config(page_title="EM Chatbot Demo", layout="centered")
 
-st.title("EM Chatbot Demo")
+st.title("ED Copilot (Prototype)")
 st.caption("Prototype for interview demo only. Not for clinical use. No PHI.")
 
 with st.expander("Disclaimer", expanded=True):
@@ -166,7 +166,7 @@ Output (keep brief):
 
 
 question = st.text_input(
-    "Type an ED question (demo):",
+    "What are you trying to figure out?",
     placeholder="e.g., adult DKA initial management labs insulin potassium",
 )
 
