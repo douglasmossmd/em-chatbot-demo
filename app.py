@@ -14,6 +14,12 @@ with st.expander("Disclaimer", expanded=True):
         "Do not use for real patient care. Do not enter patient identifiers."
     )
 
+# Simple access gate (demo only)
+pw = st.text_input("Passcode", type="password")
+if pw != st.secrets.get("APP_PASSWORD", ""):
+    st.stop()
+
+
 NCBI_ESEARCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 NCBI_ESUMMARY = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
 
