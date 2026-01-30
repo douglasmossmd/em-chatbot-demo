@@ -3,7 +3,7 @@ import requests
 import streamlit as st
 from openai import OpenAI
 
-st.set_page_config(page_title="EM Chatbot Demo", layout="centered")
+st.set_page_config(page_title="ED Copilot (Prototype)", layout="centered")
 
 st.title("ED Copilot (Prototype)")
 st.caption("Prototype for interview demo only. Not for clinical use. No PHI.")
@@ -16,7 +16,6 @@ with st.expander("Disclaimer", expanded=True):
 
 NCBI_ESEARCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 NCBI_ESUMMARY = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
-
 
 STOPWORDS = {
     "adult","peds","pediatric","initial","management","workup","labs","lab","treatment","treatments",
@@ -35,26 +34,18 @@ SYNONYMS = {
     "copd": "chronic obstructive pulmonary disease",
 }
 
-
 def make_pubmed_term(q: str) -> str:
-    """
-    PubMed can over-AND long queries. This converts long free-text into a smaller AND query
-    using 3–5 high-signal keywords, while also adding a quoted phrase fallback.
-    """
     q = (q or "").strip()
     if not q:
         return q
 
     raw = q.lower()
-    # expand common acronyms
     for k, v in SYNONYMS.items():
         raw = re.sub(rf"\b{k}\b", v, raw)
 
-    # tokenise
     cleaned = re.sub(r"[^a-z0-9\s]", " ", raw)
     tokens = [t for t in cleaned.split() if t and t not in STOPWORDS]
 
-    # keep unique order
     seen = set()
     uniq = []
     for t in tokens:
@@ -62,18 +53,13 @@ def make_pubmed_term(q: str) -> str:
             uniq.append(t)
             seen.add(t)
 
-    # take top few tokens to avoid brittle over-AND
     key = uniq[:5] if uniq else []
-
-    # Build term:
-    # - quoted phrase (broad fallback)
-    # - AND of key tokens in Title/Abstract (less brittle)
     phrase = f"\"{q}\""
+
     if key:
         and_bits = " AND ".join([f"{t}[Title/Abstract]" for t in key])
         return f"({phrase}) OR ({and_bits})"
     return phrase
-
 
 @st.cache_data(ttl=3600)
 def pubmed_search(user_query: str, retmax: int = 5):
@@ -119,7 +105,6 @@ def pubmed_search(user_query: str, retmax: int = 5):
         )
     return results
 
-
 def build_context(hits):
     if not hits:
         return "No PubMed results returned."
@@ -130,19 +115,32 @@ def build_context(hits):
         )
     return "\n".join(lines)
 
-
-def generate_em_answer(question: str, hits):
+def generate_answer(question: str, hits, mode: str):
     client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
     context = build_context(hits)
 
     system = (
         "You are an emergency medicine attending helping another ED clinician on shift. "
-        "Give concise, practical guidance. "
+        "Be concise and practical. "
         "Do not ask for or include PHI. "
         "If critical details are missing, ask up to 3 clarifying questions first, then give a best-effort answer."
     )
 
-    user = f"""Question:
+    if mode == "Discharge instructions (patient-friendly)":
+        user = f"""Question:
+{question}
+
+PubMed results you may cite (do not invent citations beyond this list):
+{context}
+
+Write patient-friendly discharge instructions at about an 8th-grade reading level.
+Include: brief explanation, what to do at home, meds if relevant (general), red flags to return, follow-up.
+Keep it brief.
+End with: "This is not medical advice and is for demo only."
+"""
+        max_tokens = 350
+    else:
+        user = f"""Question:
 {question}
 
 PubMed results you may cite (do not invent citations beyond this list):
@@ -155,15 +153,21 @@ Output (keep brief):
 - Disposition (max 4 bullets)
 - Citations: list PMIDs you used (or say "none")
 """
+        max_tokens = 450
 
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         temperature=0.2,
-        max_tokens=450,  # keeps it short/cheap
+        max_tokens=max_tokens,
     )
     return resp.choices[0].message.content
 
+mode = st.selectbox(
+    "Mode",
+    ["Workup/Treatment/Disposition", "Discharge instructions (patient-friendly)"],
+    index=0,
+)
 
 question = st.text_input(
     "What are you trying to figure out?",
@@ -192,12 +196,11 @@ if run:
                 st.markdown(f"**{i}. [{h['title'] or '(No title returned)'}]({h['url']})**")
                 st.caption(meta)
 
-        st.subheader("Draft EM-focused answer (prototype)")
+        st.subheader("Answer (prototype)")
         with st.spinner("Generating..."):
             try:
-                st.write(generate_em_answer(question, hits))
+                st.write(generate_answer(question, hits, mode))
             except KeyError:
                 st.error("Missing OPENAI_API_KEY in Streamlit Secrets.")
             except Exception as e:
                 st.error(f"OpenAI error: {e}")
-
