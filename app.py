@@ -43,10 +43,6 @@ with col1:
 with col2:
     send_sample = st.button("Send", use_container_width=True)
 
-custom_text = ""
-if pick == "Custom":
-    custom_text = st.text_input("Custom question", placeholder="Type your ED question here")
-
 # ----- PubMed helpers (metadata only) -----
 NCBI_ESEARCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 NCBI_ESUMMARY = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
@@ -227,11 +223,9 @@ if st.button("Clear chat"):
     st.rerun()
 
 # If they clicked Send on a sample/custom
-if send_sample:
-    if pick == "Custom":
-        st.session_state["pending_prompt"] = (custom_text or "").strip()
-    else:
-        st.session_state["pending_prompt"] = pick
+if send_sample and pick != "Custom":
+    st.session_state["pending_prompt"] = pick
+
 
 # Render history
 for m in st.session_state["messages"]:
