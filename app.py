@@ -1,13 +1,14 @@
 import re
 import requests
 import streamlit as st
+import xml.etree.ElementTree as ET
 from openai import OpenAI
 
+# -------------------- Page --------------------
 st.set_page_config(page_title="ED Copilot (Prototype)", layout="centered")
 
 st.title("ED Copilot (Prototype)")
 st.caption("Author: Douglas Moss, MD")
-
 
 with st.expander("Disclaimer", expanded=True):
     st.write(
@@ -15,12 +16,22 @@ with st.expander("Disclaimer", expanded=True):
         "Do not use for real patient care. Do not enter patient identifiers."
     )
 
-# Passcode gate (demo only)
+# -------------------- Demo passcode gate --------------------
 pw = st.text_input("Passcode", type="password")
 if pw != st.secrets.get("APP_PASSWORD", ""):
     st.stop()
 
-# ----- Controls -----
+# -------------------- Session state --------------------
+if "messages" not in st.session_state:
+    st.session_state["messages"] = []
+if "pending_prompt" not in st.session_state:
+    st.session_state["pending_prompt"] = None
+if "last_hits" not in st.session_state:
+    st.session_state["last_hits"] = None
+if "quick_pick" not in st.session_state:
+    st.session_state["quick_pick"] = ""
+
+# -------------------- Controls --------------------
 mode = st.selectbox(
     "Mode",
     ["Workup/Treatment/Disposition", "Discharge instructions (patient-friendly)"],
@@ -29,7 +40,9 @@ mode = st.selectbox(
 
 with st.expander("Retrieval settings", expanded=False):
     retmax = st.slider("PubMed results to pull", 3, 10, 5)
+    include_abstracts = st.toggle("Include abstracts (slower, better grounding)", value=False)
 
+# Quick prompts (hide after chat starts)
 samples = [
     "Chest pain, rule-out ACS with high-sensitivity troponin in the ED",
     "Suspected pulmonary embolism, when to image vs D-dimer",
@@ -38,22 +51,35 @@ samples = [
     "DKA initial management, potassium and insulin",
 ]
 
-col1, col2 = st.columns([2, 1])
-with col1:
-    pick = st.selectbox("Quick prompt", ["Custom"] + samples, index=0)
-with col2:
-    send_sample = st.button("Send", use_container_width=True)
+if len(st.session_state["messages"]) == 0:
+    pick = st.selectbox("Quick prompt", [""] + samples, key="quick_pick")
+    if pick:
+        st.session_state["pending_prompt"] = pick
+        st.session_state["quick_pick"] = ""  # reset so it won't auto-resubmit
+        st.rerun()
 
-# ----- PubMed helpers (metadata only) -----
+# Clear chat
+if st.button("Clear chat"):
+    st.session_state["messages"] = []
+    st.session_state["pending_prompt"] = None
+    st.session_state["last_hits"] = None
+    st.session_state["quick_pick"] = ""
+    st.rerun()
+
+# -------------------- PubMed helpers --------------------
 NCBI_ESEARCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 NCBI_ESUMMARY = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+NCBI_EFETCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 
 STOPWORDS = {
     "adult","peds","pediatric","initial","management","workup","labs","lab","treatment","treatments",
     "criteria","admission","disposition","dx","ddx","ed","em","er","the","a","an","and","or","to",
     "for","of","with","without","in","on","at","by","from","vs","versus","suspected","possible",
-    "patient","patients","male","female","man","woman","yo","y/o","year","old","criteria","consider"
+    "patient","patients","male","female","man","woman","yo","y/o","year","old","criteria","consider",
+    "how","what","when","why","should","could","would","can","do","does","did","best","ways","way",
+    "manage","management","treat","treatment","workup","evaluation","approach"
 }
+
 SYNONYMS = {
     "dka": "diabetic ketoacidosis",
     "pe": "pulmonary embolism",
@@ -62,12 +88,18 @@ SYNONYMS = {
     "tbi": "traumatic brain injury",
     "uti": "urinary tract infection",
     "copd": "chronic obstructive pulmonary disease",
+    "afib": "atrial fibrillation",
+    "rvr": "rapid ventricular response",
 }
 
 def make_pubmed_term(q: str) -> str:
+    """
+    Produces a reasonable first-pass PubMed query for natural language.
+    We avoid quoting the full question because that almost always kills recall.
+    """
     q = (q or "").strip()
     if not q:
-        return q
+        return ""
 
     raw = q.lower()
     for k, v in SYNONYMS.items():
@@ -83,33 +115,64 @@ def make_pubmed_term(q: str) -> str:
             uniq.append(t)
             seen.add(t)
 
-    key = uniq[:5] if uniq else []
-    phrase = f"\"{q}\""
+    key = uniq[:6] if uniq else []
+
+    # Prefer OR across key terms in title/abstract, let PubMed do its own mapping too.
+    # Example: (chest[tiab] OR pain[tiab] OR troponin[tiab]) OR (chest pain troponin)
     if key:
-        and_bits = " AND ".join([f"{t}[Title/Abstract]" for t in key])
-        return f"({phrase}) OR ({and_bits})"
-    return phrase
+        tiab_or = " OR ".join([f"{t}[tiab]" for t in key])
+        raw_fallback = " ".join(key)
+        return f"({tiab_or}) OR ({raw_fallback})"
+
+    return q
 
 @st.cache_data(ttl=3600)
 def pubmed_search(term: str, retmax: int = 5):
-    r = requests.get(
-        NCBI_ESEARCH,
-        params={
-            "db": "pubmed",
-            "term": make_pubmed_term(term),
-            "retmode": "json",
-            "retmax": retmax,
-            "sort": "relevance",
-        },
-        timeout=20,
-    )
-    r.raise_for_status()
-    return r.json().get("esearchresult", {}).get("idlist", [])
+    """
+    Progressive relaxation so natural language questions still get hits.
+    """
+    q = (term or "").strip()
+    if not q:
+        return []
+
+    cooked = make_pubmed_term(q)
+
+    candidates = [
+        cooked,                                  # structured-ish
+        cooked.replace(" AND ", " OR "),         # (in case any ANDs slip in)
+        re.sub(r"\[Title/Abstract\]", "[tiab]", cooked),
+        " ".join(re.findall(r"[A-Za-z0-9]+", q)[:8]),  # raw-ish keywords, PubMed translation helps
+        q,                                       # absolute fallback: raw question
+    ]
+
+    for t in candidates:
+        t = (t or "").strip()
+        if not t:
+            continue
+
+        r = requests.get(
+            NCBI_ESEARCH,
+            params={
+                "db": "pubmed",
+                "term": t,
+                "retmode": "json",
+                "retmax": retmax,
+                "sort": "relevance",
+            },
+            timeout=20,
+        )
+        r.raise_for_status()
+        ids = r.json().get("esearchresult", {}).get("idlist", [])
+        if ids:
+            return ids
+
+    return []
 
 @st.cache_data(ttl=3600)
 def pubmed_summaries(pmids):
     if not pmids:
         return []
+
     r = requests.get(
         NCBI_ESUMMARY,
         params={"db": "pubmed", "id": ",".join(pmids), "retmode": "json"},
@@ -134,18 +197,69 @@ def pubmed_summaries(pmids):
         )
     return out
 
-def build_metadata_context(summaries, max_items=5):
+@st.cache_data(ttl=3600)
+def pubmed_abstracts(pmids):
+    """
+    Fetch abstracts via EFetch (XML). Returns {pmid: abstract_text}.
+    """
+    if not pmids:
+        return {}
+
+    r = requests.get(
+        NCBI_EFETCH,
+        params={
+            "db": "pubmed",
+            "id": ",".join(pmids),
+            "retmode": "xml",
+        },
+        timeout=25,
+    )
+    r.raise_for_status()
+
+    root = ET.fromstring(r.text)
+    out = {}
+
+    for article in root.findall(".//PubmedArticle"):
+        pmid_el = article.find(".//MedlineCitation/PMID")
+        pmid = (pmid_el.text or "").strip() if pmid_el is not None else ""
+        if not pmid:
+            continue
+
+        abs_parts = []
+        for a in article.findall(".//Abstract/AbstractText"):
+            label = a.attrib.get("Label")
+            txt = "".join(a.itertext()).strip()
+            if not txt:
+                continue
+            abs_parts.append(f"{label}: {txt}" if label else txt)
+
+        if abs_parts:
+            out[pmid] = "\n".join(abs_parts)
+
+    return out
+
+def build_metadata_context(summaries, abstracts=None, max_items=5, abstract_chars=900):
     use = summaries[:max_items]
     lines = []
     allowed_pmids = []
+    abstracts = abstracts or {}
+
     for h in use:
-        allowed_pmids.append(h["pmid"])
-        lines.append(
-            f"- {h['title']} ({h['journal']}, {h['year']}). PMID {h['pmid']}. {h['url']}"
-        )
+        pmid = h["pmid"]
+        allowed_pmids.append(pmid)
+
+        base = f"- {h['title']} ({h['journal']}, {h['year']}). PMID {pmid}. {h['url']}"
+        ab = (abstracts.get(pmid) or "").strip()
+
+        if ab:
+            ab = ab[:abstract_chars].rstrip()
+            base += f"\n  Abstract (truncated): {ab}"
+
+        lines.append(base)
+
     return "\n".join(lines) if lines else "No PubMed results returned.", allowed_pmids
 
-# ----- LLM -----
+# -------------------- LLM --------------------
 def generate_answer(prior_messages, question: str, meta_context: str, allowed_pmids, mode: str):
     client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
     allowed_str = ", ".join(allowed_pmids) if allowed_pmids else "none"
@@ -154,6 +268,8 @@ def generate_answer(prior_messages, question: str, meta_context: str, allowed_pm
         "You are an emergency medicine attending helping another ED clinician on shift. "
         "Be concise and practical. "
         "Do not ask for or include PHI. "
+        "Use only the provided PubMed metadata/abstracts for evidence. "
+        "If abstracts are not provided, explicitly note that evidence grounding is limited. "
         "If critical details are missing, ask up to 3 clarifying questions first, then give a best-effort answer. "
         "Only cite PMIDs that appear in Allowed PMIDs. "
         "If Allowed PMIDs is not 'none', you MUST cite at least 1 PMID from it."
@@ -169,7 +285,7 @@ def generate_answer(prior_messages, question: str, meta_context: str, allowed_pm
         user = f"""User question:
 {question}
 
-PubMed results (metadata only):
+PubMed results (metadata{' + abstracts' if 'Abstract (truncated):' in meta_context else ''}):
 {meta_context}
 
 {pmid_rule}
@@ -184,7 +300,7 @@ End with: "This is not medical advice and is for demo only."
         user = f"""User question:
 {question}
 
-PubMed results (metadata only):
+PubMed results (metadata{' + abstracts' if 'Abstract (truncated):' in meta_context else ''}):
 {meta_context}
 
 {pmid_rule}
@@ -208,40 +324,21 @@ Output (keep brief):
     )
     return resp.choices[0].message.content
 
-# ----- Chat state -----
-if "messages" not in st.session_state:
-    st.session_state["messages"] = []
-if "pending_prompt" not in st.session_state:
-    st.session_state["pending_prompt"] = None
-if "last_hits" not in st.session_state:
-    st.session_state["last_hits"] = None
-
-# Clear chat button
-if st.button("Clear chat"):
-    st.session_state["messages"] = []
-    st.session_state["pending_prompt"] = None
-    st.session_state["last_hits"] = None
-    st.rerun()
-
-# If they clicked Send on a sample/custom
-if send_sample and pick != "Custom":
-    st.session_state["pending_prompt"] = pick
-
-
-# Render history
+# -------------------- Render history --------------------
 for m in st.session_state["messages"]:
     with st.chat_message(m["role"]):
         st.write(m["content"])
 
-# Chat input
+# -------------------- Chat input --------------------
 typed = st.chat_input("Ask an ED question (no PHI).")
 prompt = (typed or "").strip() if typed else None
 
-# Use pending prompt if set
+# Auto-submit sample if selected
 if not prompt and st.session_state["pending_prompt"]:
     prompt = st.session_state["pending_prompt"]
     st.session_state["pending_prompt"] = None
 
+# -------------------- Main interaction --------------------
 if prompt:
     st.session_state["messages"].append({"role": "user", "content": prompt})
     with st.chat_message("user"):
@@ -252,18 +349,30 @@ if prompt:
             pmids = pubmed_search(prompt, retmax=retmax)
             summaries = pubmed_summaries(pmids)
 
-            # show top hits
             if not summaries:
                 st.write("No PubMed results found. Try fewer words or more general terms.")
                 meta_context, allowed_pmids = "No PubMed results returned.", []
+                abstract_map = {}
             else:
+                # Only fetch abstracts for the items we will show/use
+                show_pmids = [h["pmid"] for h in summaries[:retmax]]
+                abstract_map = pubmed_abstracts(show_pmids) if include_abstracts else {}
+
                 st.subheader("Top PubMed results")
                 for i, h in enumerate(summaries[:retmax], start=1):
                     meta = " · ".join([x for x in [h["journal"], h["year"], f"PMID {h['pmid']}"] if x])
                     st.markdown(f"**{i}. [{h['title'] or '(No title returned)'}]({h['url']})**")
                     st.caption(meta)
 
-                meta_context, allowed_pmids = build_metadata_context(summaries, max_items=retmax)
+                    if include_abstracts:
+                        ab = (abstract_map.get(h["pmid"]) or "").strip()
+                        if ab:
+                            with st.expander("Abstract", expanded=False):
+                                st.write(ab)
+
+                meta_context, allowed_pmids = build_metadata_context(
+                    summaries, abstracts=abstract_map, max_items=retmax
+                )
 
         with st.spinner("Generating answer..."):
             try:
