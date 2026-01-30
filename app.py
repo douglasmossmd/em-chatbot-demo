@@ -1,3 +1,4 @@
+import re
 import requests
 import streamlit as st
 from openai import OpenAI
@@ -5,24 +6,84 @@ from openai import OpenAI
 st.set_page_config(page_title="EM Chatbot Demo", layout="centered")
 
 st.title("EM Chatbot Demo")
-st.caption("Prototype for interview demo only. Not for clinical use.")
+st.caption("Prototype for interview demo only. Not for clinical use. No PHI.")
 
 with st.expander("Disclaimer", expanded=True):
     st.write(
         "This is a prototype demonstration. It may be wrong or incomplete. "
-        "Do not use for real patient care. No PHI."
+        "Do not use for real patient care. Do not enter patient identifiers."
     )
 
 NCBI_ESEARCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 NCBI_ESUMMARY = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
 
+
+STOPWORDS = {
+    "adult","peds","pediatric","initial","management","workup","labs","lab","treatment","treatments",
+    "criteria","admission","disposition","dx","ddx","ed","em","er","the","a","an","and","or","to",
+    "for","of","with","without","in","on","at","by","from","vs","versus","suspected","possible",
+    "patient","patients","male","female","man","woman","yo","y/o","year","old"
+}
+
+SYNONYMS = {
+    "dka": "diabetic ketoacidosis",
+    "pe": "pulmonary embolism",
+    "acs": "acute coronary syndrome",
+    "ich": "intracerebral hemorrhage",
+    "tbi": "traumatic brain injury",
+    "uti": "urinary tract infection",
+    "copd": "chronic obstructive pulmonary disease",
+}
+
+
+def make_pubmed_term(q: str) -> str:
+    """
+    PubMed can over-AND long queries. This converts long free-text into a smaller AND query
+    using 3–5 high-signal keywords, while also adding a quoted phrase fallback.
+    """
+    q = (q or "").strip()
+    if not q:
+        return q
+
+    raw = q.lower()
+    # expand common acronyms
+    for k, v in SYNONYMS.items():
+        raw = re.sub(rf"\b{k}\b", v, raw)
+
+    # tokenise
+    cleaned = re.sub(r"[^a-z0-9\s]", " ", raw)
+    tokens = [t for t in cleaned.split() if t and t not in STOPWORDS]
+
+    # keep unique order
+    seen = set()
+    uniq = []
+    for t in tokens:
+        if t not in seen:
+            uniq.append(t)
+            seen.add(t)
+
+    # take top few tokens to avoid brittle over-AND
+    key = uniq[:5] if uniq else []
+
+    # Build term:
+    # - quoted phrase (broad fallback)
+    # - AND of key tokens in Title/Abstract (less brittle)
+    phrase = f"\"{q}\""
+    if key:
+        and_bits = " AND ".join([f"{t}[Title/Abstract]" for t in key])
+        return f"({phrase}) OR ({and_bits})"
+    return phrase
+
+
 @st.cache_data(ttl=3600)
-def pubmed_search(query: str, retmax: int = 5):
+def pubmed_search(user_query: str, retmax: int = 5):
+    term = make_pubmed_term(user_query)
+
     r = requests.get(
         NCBI_ESEARCH,
         params={
             "db": "pubmed",
-            "term": query,
+            "term": term,
             "retmode": "json",
             "retmax": retmax,
             "sort": "relevance",
@@ -51,67 +112,67 @@ def pubmed_search(query: str, retmax: int = 5):
             {
                 "pmid": pmid,
                 "title": (item.get("title", "") or "").strip().rstrip("."),
-                "journal": item.get("fulljournalname", ""),
-                "year": (item.get("pubdate", "") or "").split(" ")[0],
+                "journal": item.get("fulljournalname", "") or "",
+                "year": ((item.get("pubdate", "") or "").split(" ")[0]) or "",
                 "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
             }
         )
     return results
 
+
 def build_context(hits):
-    # Minimal context for the LLM: titles + metadata + links
+    if not hits:
+        return "No PubMed results returned."
     lines = []
     for h in hits:
         lines.append(
-            f"- {h['title']} ({h.get('journal','')}, {h.get('year','')}). PMID {h['pmid']}. {h['url']}"
+            f"- {h['title']} ({h['journal']}, {h['year']}). PMID {h['pmid']}. {h['url']}"
         )
     return "\n".join(lines)
 
+
 def generate_em_answer(question: str, hits):
     client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+    context = build_context(hits)
 
-    context = build_context(hits) if hits else "No PubMed results returned."
     system = (
         "You are an emergency medicine attending helping another ED clinician on shift. "
-        "This is a prototype demo, not for real clinical use. "
-        "Do not request or include any patient identifiers. "
-        "If the question lacks key details, ask 2-4 focused clarifying questions first. "
-        "When you answer, be practical and ED-focused."
+        "Give concise, practical guidance. "
+        "Do not ask for or include PHI. "
+        "If critical details are missing, ask up to 3 clarifying questions first, then give a best-effort answer."
     )
-    user = f"""Clinical question:
+
+    user = f"""Question:
 {question}
 
-PubMed results (use as citations, do not invent citations not in this list):
+PubMed results you may cite (do not invent citations beyond this list):
 {context}
 
-Output format:
-1) Quick take (2-3 bullets)
-2) Labs/diagnostics to consider (bullets)
-3) Treatments (bullets)
-4) Disposition/admission criteria (bullets)
-5) Red flags / must-not-miss (bullets)
-6) Citations: list the relevant PMIDs you used
-Important: If evidence is weak or mixed, say so plainly.
+Output (keep brief):
+- Quick take (max 3 bullets)
+- Workup (labs/imaging) (max 6 bullets)
+- Treatment (max 6 bullets)
+- Disposition (max 4 bullets)
+- Citations: list PMIDs you used (or say "none")
 """
 
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         temperature=0.2,
+        max_tokens=450,  # keeps it short/cheap
     )
     return resp.choices[0].message.content
 
+
 question = st.text_input(
     "Type an ED question (demo):",
-    placeholder="e.g., suspected septic shock initial workup and antibiotics",
+    placeholder="e.g., adult DKA initial management labs insulin potassium",
 )
 
 col1, col2 = st.columns(2)
 with col1:
-    retmax = st.slider("How many PubMed hits to pull", 3, 10, 5)
+    retmax = st.slider("PubMed hits", 3, 10, 5)
 with col2:
     run = st.button("Generate answer")
 
@@ -124,20 +185,19 @@ if run:
 
         st.subheader("Top PubMed results")
         if not hits:
-            st.write("No results found. Try different keywords.")
+            st.write("No results found. Try fewer words or more general terms.")
         else:
             for i, h in enumerate(hits, start=1):
-                title = h["title"] or "(No title returned)"
                 meta = " · ".join([x for x in [h["journal"], h["year"], f"PMID {h['pmid']}"] if x])
-                st.markdown(f"**{i}. [{title}]({h['url']})**")
+                st.markdown(f"**{i}. [{h['title'] or '(No title returned)'}]({h['url']})**")
                 st.caption(meta)
 
         st.subheader("Draft EM-focused answer (prototype)")
-        with st.spinner("Generating answer..."):
+        with st.spinner("Generating..."):
             try:
-                answer = generate_em_answer(question, hits)
-                st.write(answer)
+                st.write(generate_em_answer(question, hits))
             except KeyError:
                 st.error("Missing OPENAI_API_KEY in Streamlit Secrets.")
             except Exception as e:
-                st.error(f"Error generating answer: {e}")
+                st.error(f"OpenAI error: {e}")
+
