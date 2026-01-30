@@ -53,7 +53,6 @@ def _on_pick_sample():
     sel = st.session_state.get("quick_pick", "")
     if sel and sel != "Select a sample...":
         st.session_state["pending_prompt"] = sel
-        st.rerun()
 
 if len(st.session_state["messages"]) == 0:
     st.selectbox(
@@ -62,7 +61,6 @@ if len(st.session_state["messages"]) == 0:
         key="quick_pick",
         on_change=_on_pick_sample,
     )
-
 
 # Clear chat
 if st.button("Clear chat"):
