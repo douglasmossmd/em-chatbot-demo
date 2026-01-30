@@ -211,20 +211,18 @@ if run:
                 st.markdown(f"**{i}. [{h['title'] or '(No title returned)'}]({h['url']})**")
                 st.caption(meta)
 
-  st.subheader("Answer (prototype)")
-with st.spinner("Generating..."):
-    try:
-        answer = generate_answer(final_q, hits, mode)
-        st.write(answer)
+        st.subheader("Answer (prototype)")
+        with st.spinner("Generating..."):
+            try:
+                answer = generate_answer(final_q, hits, mode)
+                st.write(answer)
 
-        # Try to extract PMIDs the model listed and display quick links
-        pmids = re.findall(r"\b\d{7,8}\b", answer)
-        pmids = list(dict.fromkeys(pmids))  # de-dupe, keep order
-        if pmids:
-            st.caption("PMIDs cited:")
-            st.markdown(" ".join([f"[{p}](https://pubmed.ncbi.nlm.nih.gov/{p}/)" for p in pmids]))
-    except KeyError:
-        st.error("Missing OPENAI_API_KEY or APP_PASSWORD in Streamlit Secrets.")
-    except Exception as e:
-        st.error(f"OpenAI error: {e}")
-
+                pmids = re.findall(r"\b\d{7,8}\b", answer)
+                pmids = list(dict.fromkeys(pmids))
+                if pmids:
+                    st.caption("PMIDs cited:")
+                    st.markdown(" ".join([f"[{p}](https://pubmed.ncbi.nlm.nih.gov/{p}/)" for p in pmids]))
+            except KeyError:
+                st.error("Missing OPENAI_API_KEY or APP_PASSWORD in Streamlit Secrets.")
+            except Exception as e:
+                st.error(f"OpenAI error: {e}")
