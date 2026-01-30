@@ -28,8 +28,6 @@ if "pending_prompt" not in st.session_state:
     st.session_state["pending_prompt"] = None
 if "last_hits" not in st.session_state:
     st.session_state["last_hits"] = None
-if "quick_pick" not in st.session_state:
-    st.session_state["quick_pick"] = ""
 
 # -------------------- Controls --------------------
 mode = st.selectbox(
@@ -51,12 +49,20 @@ samples = [
     "DKA initial management, potassium and insulin",
 ]
 
-if len(st.session_state["messages"]) == 0:
-    pick = st.selectbox("Quick prompt", [""] + samples, key="quick_pick")
-    if pick:
-        st.session_state["pending_prompt"] = pick
-        st.session_state["quick_pick"] = ""  # reset so it won't auto-resubmit
+def _on_pick_sample():
+    sel = st.session_state.get("quick_pick", "")
+    if sel and sel != "Select a sample...":
+        st.session_state["pending_prompt"] = sel
         st.rerun()
+
+if len(st.session_state["messages"]) == 0:
+    st.selectbox(
+        "Quick prompt",
+        ["Select a sample..."] + samples,
+        key="quick_pick",
+        on_change=_on_pick_sample,
+    )
+
 
 # Clear chat
 if st.button("Clear chat"):
