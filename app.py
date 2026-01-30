@@ -1,8 +1,10 @@
 import re
 import requests
 import streamlit as st
+import xml.etree.ElementTree as ET
 from openai import OpenAI
 
+# ---------------- UI / page ----------------
 st.set_page_config(page_title="ED Copilot (Prototype)", layout="centered")
 
 st.title("ED Copilot (Prototype)")
@@ -14,21 +16,43 @@ with st.expander("Disclaimer", expanded=True):
         "Do not use for real patient care. Do not enter patient identifiers."
     )
 
-# Simple access gate (demo only)
+# Passcode gate (demo only)
 pw = st.text_input("Passcode", type="password")
 if pw != st.secrets.get("APP_PASSWORD", ""):
     st.stop()
 
+# ---------------- Settings controls ----------------
+mode = st.selectbox(
+    "Mode",
+    ["Workup/Treatment/Disposition", "Discharge instructions (patient-friendly)"],
+    index=0,
+)
+
+with st.expander("Retrieval settings", expanded=False):
+    retmax = st.slider("PubMed results to pull", 3, 10, 5)
+    abstracts_to_use = st.slider("Abstracts to include in context", 1, 5, 3)
+    max_abstract_chars = st.slider("Max chars per abstract", 400, 2000, 1200, step=100)
+
+colA, colB = st.columns(2)
+with colA:
+    if st.button("Clear chat"):
+        st.session_state["messages"] = []
+        st.session_state["last_evidence"] = None
+        st.rerun()
+with colB:
+    st.caption("Chat persists during this session only.")
+
+# ---------------- PubMed helpers ----------------
 NCBI_ESEARCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 NCBI_ESUMMARY = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+NCBI_EFETCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 
 STOPWORDS = {
     "adult","peds","pediatric","initial","management","workup","labs","lab","treatment","treatments",
     "criteria","admission","disposition","dx","ddx","ed","em","er","the","a","an","and","or","to",
     "for","of","with","without","in","on","at","by","from","vs","versus","suspected","possible",
-    "patient","patients","male","female","man","woman","yo","y/o","year","old"
+    "patient","patients","male","female","man","woman","yo","y/o","year","old","criteria","consider"
 }
-
 SYNONYMS = {
     "dka": "diabetic ketoacidosis",
     "pe": "pulmonary embolism",
@@ -40,11 +64,6 @@ SYNONYMS = {
 }
 
 def make_pubmed_term(q: str) -> str:
-    """
-    Convert long free-text into a less brittle PubMed term:
-    - quoted phrase fallback
-    - AND of up to 5 high-signal tokens in Title/Abstract
-    """
     q = (q or "").strip()
     if not q:
         return q
@@ -65,21 +84,18 @@ def make_pubmed_term(q: str) -> str:
 
     key = uniq[:5] if uniq else []
     phrase = f"\"{q}\""
-
     if key:
         and_bits = " AND ".join([f"{t}[Title/Abstract]" for t in key])
         return f"({phrase}) OR ({and_bits})"
     return phrase
 
 @st.cache_data(ttl=3600)
-def pubmed_search(user_query: str, retmax: int = 5):
-    term = make_pubmed_term(user_query)
-
+def pubmed_search(term: str, retmax: int = 5):
     r = requests.get(
         NCBI_ESEARCH,
         params={
             "db": "pubmed",
-            "term": term,
+            "term": make_pubmed_term(term),
             "retmode": "json",
             "retmax": retmax,
             "sort": "relevance",
@@ -88,23 +104,25 @@ def pubmed_search(user_query: str, retmax: int = 5):
     )
     r.raise_for_status()
     pmids = r.json().get("esearchresult", {}).get("idlist", [])
+    return pmids
+
+@st.cache_data(ttl=3600)
+def pubmed_summaries(pmids):
     if not pmids:
         return []
-
-    r2 = requests.get(
+    r = requests.get(
         NCBI_ESUMMARY,
         params={"db": "pubmed", "id": ",".join(pmids), "retmode": "json"},
         timeout=20,
     )
-    r2.raise_for_status()
-    data = r2.json()
-
-    results = []
+    r.raise_for_status()
+    data = r.json()
+    out = []
     for pmid in pmids:
         item = data.get("result", {}).get(pmid, {})
         if not item:
             continue
-        results.append(
+        out.append(
             {
                 "pmid": pmid,
                 "title": (item.get("title", "") or "").strip().rstrip("."),
@@ -113,134 +131,204 @@ def pubmed_search(user_query: str, retmax: int = 5):
                 "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
             }
         )
-    return results
+    return out
 
-def build_context(hits):
-    if not hits:
-        return "No PubMed results returned."
+@st.cache_data(ttl=3600)
+def pubmed_fetch_abstracts(pmids):
+    """
+    Fetch abstracts via EFetch XML. Many entries will have no abstract; we handle that.
+    """
+    if not pmids:
+        return {}
+
+    r = requests.get(
+        NCBI_EFETCH,
+        params={
+            "db": "pubmed",
+            "id": ",".join(pmids),
+            "retmode": "xml",
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    xml_text = r.text
+
+    root = ET.fromstring(xml_text)
+    abstracts = {}
+
+    for article in root.findall(".//PubmedArticle"):
+        pmid_el = article.find(".//PMID")
+        if pmid_el is None:
+            continue
+        pmid = pmid_el.text.strip()
+
+        abs_nodes = article.findall(".//Abstract/AbstractText")
+        if not abs_nodes:
+            abstracts[pmid] = ""
+            continue
+
+        parts = []
+        for n in abs_nodes:
+            label = n.attrib.get("Label")
+            text = "".join(n.itertext()).strip()
+            if not text:
+                continue
+            if label:
+                parts.append(f"{label}: {text}")
+            else:
+                parts.append(text)
+        abstracts[pmid] = "\n".join(parts).strip()
+
+    # Ensure every requested PMID has a key
+    for p in pmids:
+        abstracts.setdefault(p, "")
+
+    return abstracts
+
+def build_evidence_block(summaries, abstracts_map, abstracts_to_use=3, max_chars=1200):
+    """
+    Build a compact evidence context: title + PMID + abstract (trimmed).
+    """
+    use = summaries[:abstracts_to_use]
     lines = []
-    for h in hits:
-        lines.append(
-            f"- {h['title']} ({h['journal']}, {h['year']}). PMID {h['pmid']}. {h['url']}"
-        )
-    return "\n".join(lines)
+    allowed_pmids = []
+    for h in use:
+        pmid = h["pmid"]
+        allowed_pmids.append(pmid)
+        abstract = (abstracts_map.get(pmid) or "").strip()
+        if abstract:
+            if len(abstract) > max_chars:
+                abstract = abstract[:max_chars].rstrip() + "…"
+        else:
+            abstract = "(No abstract available via PubMed.)"
 
-def generate_answer(question: str, hits, mode: str):
+        lines.append(
+            f"PMID {pmid}\nTitle: {h['title']}\nJournal/Year: {h['journal']} ({h['year']})\nAbstract:\n{abstract}\nLink: {h['url']}"
+        )
+    return "\n\n---\n\n".join(lines), allowed_pmids
+
+# ---------------- LLM answer ----------------
+def generate_answer(messages, question: str, evidence_text: str, allowed_pmids, mode: str):
     client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
-    context = build_context(hits)
-    allowed_pmids = [h["pmid"] for h in hits] if hits else []
+
+    allowed_str = ", ".join(allowed_pmids) if allowed_pmids else "none"
 
     system = (
         "You are an emergency medicine attending helping another ED clinician on shift. "
         "Be concise and practical. "
         "Do not ask for or include PHI. "
         "If critical details are missing, ask up to 3 clarifying questions first, then give a best-effort answer. "
-        "Only cite PMIDs that appear in the provided PubMed results list. "
-        "If the PubMed results list is non-empty, you MUST cite at least 1 PMID from it."
-    )
-
-    pmid_rule = (
-        f"Allowed PMIDs: {', '.join(allowed_pmids) if allowed_pmids else 'none'}\n"
-        "RULE: If Allowed PMIDs is not 'none', you MUST end with 'Citations: ' followed by 1–3 PMIDs from Allowed PMIDs.\n"
-        "Do not write 'none' if Allowed PMIDs is not 'none'.\n"
+        "Only cite PMIDs that appear in Allowed PMIDs. "
+        "If Allowed PMIDs is not 'none', you MUST cite at least 1 PMID from it."
     )
 
     if mode == "Discharge instructions (patient-friendly)":
-        user = f"""Question:
+        user = f"""User question:
 {question}
 
-PubMed results you may cite (do not invent citations beyond this list):
-{context}
+Allowed PMIDs: {allowed_str}
 
-{pmid_rule}
+Evidence (abstracts):
+{evidence_text}
 
 Write patient-friendly discharge instructions at about an 8th-grade reading level.
 Include: brief explanation, what to do at home, meds if relevant (general), red flags to return, follow-up.
 Keep it brief.
 End with: "This is not medical advice and is for demo only."
+Then end with: Citations: <1–3 PMIDs from Allowed PMIDs> (required if Allowed PMIDs is not 'none').
 """
         max_tokens = 350
     else:
-        user = f"""Question:
+        user = f"""User question:
 {question}
 
-PubMed results you may cite (do not invent citations beyond this list):
-{context}
+Allowed PMIDs: {allowed_str}
 
-{pmid_rule}
+Evidence (abstracts):
+{evidence_text}
 
 Output (keep brief):
 - Quick take (max 3 bullets)
 - Workup (labs/imaging) (max 6 bullets)
 - Treatment (max 6 bullets)
 - Disposition (max 4 bullets)
-- Citations: 1–3 PMIDs (required if Allowed PMIDs is not 'none')
+- Citations: <1–3 PMIDs from Allowed PMIDs> (required if Allowed PMIDs is not 'none')
 """
         max_tokens = 450
 
+    # Include prior conversation turns, but keep it light: just the message contents.
+    # Streamlit stores messages as {"role": "user"/"assistant", "content": "..."}.
+    convo = [{"role": "system", "content": system}] + messages + [{"role": "user", "content": user}]
+
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        messages=convo,
         temperature=0.2,
         max_tokens=max_tokens,
     )
     return resp.choices[0].message.content
 
-# ---- Interview demo UI ----
-mode = st.selectbox(
-    "Mode",
-    ["Workup/Treatment/Disposition", "Discharge instructions (patient-friendly)"],
-    index=0,
-)
+# ---------------- Chat state ----------------
+if "messages" not in st.session_state:
+    st.session_state["messages"] = []
+if "last_evidence" not in st.session_state:
+    st.session_state["last_evidence"] = None
 
-samples = [
-    "Chest pain, rule-out ACS with high-sensitivity troponin in the ED",
-    "Suspected pulmonary embolism, when to image vs D-dimer",
-    "Sepsis initial bundle in the ED, antibiotics and fluids",
-    "New-onset atrial fibrillation with RVR, rate vs rhythm and disposition",
-    "DKA initial management, potassium and insulin",
-]
-pick = st.selectbox("Question", ["Custom"] + samples, index=0)
+# Render chat history
+for m in st.session_state["messages"]:
+    with st.chat_message(m["role"]):
+        st.write(m["content"])
 
-if pick == "Custom":
-    final_q = st.text_input("Custom question", placeholder="Type your ED question here")
-else:
-    final_q = pick
+# Chat input
+prompt = st.chat_input("Ask an ED question (no PHI).")
+if prompt:
+    st.session_state["messages"].append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.write(prompt)
 
-col1, col2 = st.columns(2)
-with col1:
-    retmax = st.slider("PubMed hits", 3, 10, 5)
-with col2:
-    run = st.button("Run demo")
+    with st.chat_message("assistant"):
+        with st.spinner("Searching PubMed and fetching abstracts..."):
+            pmids = pubmed_search(prompt, retmax=retmax)
+            summaries = pubmed_summaries(pmids)
+            abstracts_map = pubmed_fetch_abstracts(pmids)
 
-if run:
-    if not (final_q or "").strip():
-        st.warning("Type a question first.")
-    else:
-        with st.spinner("Searching PubMed..."):
-            hits = pubmed_search(final_q, retmax=retmax)
+            evidence_text, allowed_pmids = build_evidence_block(
+                summaries,
+                abstracts_map,
+                abstracts_to_use=abstracts_to_use,
+                max_chars=max_abstract_chars,
+            )
 
-        st.subheader("Top PubMed results")
-        if not hits:
-            st.write("No results found. Try fewer words or more general terms.")
-        else:
-            for i, h in enumerate(hits, start=1):
-                meta = " · ".join([x for x in [h["journal"], h["year"], f"PMID {h['pmid']}"] if x])
-                st.markdown(f"**{i}. [{h['title'] or '(No title returned)'}]({h['url']})**")
-                st.caption(meta)
+            # Store last evidence for transparency/debug
+            st.session_state["last_evidence"] = {
+                "summaries": summaries,
+                "allowed_pmids": allowed_pmids,
+                "evidence_text": evidence_text,
+            }
 
-        st.subheader("Answer (prototype)")
-        with st.spinner("Generating..."):
+        with st.spinner("Generating answer..."):
             try:
-                answer = generate_answer(final_q, hits, mode)
+                answer = generate_answer(
+                    messages=st.session_state["messages"][-6:-1],  # last few turns only
+                    question=prompt,
+                    evidence_text=evidence_text,
+                    allowed_pmids=allowed_pmids,
+                    mode=mode,
+                )
                 st.write(answer)
 
-                pmids = re.findall(r"\b\d{7,8}\b", answer)
-                pmids = list(dict.fromkeys(pmids))
-                if pmids:
+                # PMID quick links from answer
+                pmids_in_answer = re.findall(r"\b\d{7,8}\b", answer)
+                pmids_in_answer = list(dict.fromkeys(pmids_in_answer))
+                if pmids_in_answer:
                     st.caption("PMIDs cited:")
-                    st.markdown(" ".join([f"[{p}](https://pubmed.ncbi.nlm.nih.gov/{p}/)" for p in pmids]))
-            except KeyError:
-                st.error("Missing OPENAI_API_KEY or APP_PASSWORD in Streamlit Secrets.")
+                    st.markdown(" ".join([f"[{p}](https://pubmed.ncbi.nlm.nih.gov/{p}/)" for p in pmids_in_answer]))
+
+                # Optional: show what abstracts were fed in
+                with st.expander("Evidence used (abstracts sent to model)", expanded=False):
+                    st.text(evidence_text if evidence_text else "(none)")
+
+                st.session_state["messages"].append({"role": "assistant", "content": answer})
+
             except Exception as e:
-                st.error(f"OpenAI error: {e}")
+                st.error(f"Error: {e}")
