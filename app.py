@@ -6,7 +6,8 @@ from openai import OpenAI
 st.set_page_config(page_title="ED Copilot (Prototype)", layout="centered")
 
 st.title("ED Copilot (Prototype)")
-st.caption("Prototype for interview demo only. Not for clinical use. No PHI.")
+st.caption("Author: Douglas Moss, MD · Prototype for demo only. Not for clinical use. No PHI.")
+
 
 with st.expander("Disclaimer", expanded=True):
     st.write(
