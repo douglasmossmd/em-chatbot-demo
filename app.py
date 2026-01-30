@@ -19,7 +19,6 @@ pw = st.text_input("Passcode", type="password")
 if pw != st.secrets.get("APP_PASSWORD", ""):
     st.stop()
 
-
 NCBI_ESEARCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 NCBI_ESUMMARY = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
 
@@ -169,29 +168,39 @@ Output (keep brief):
     )
     return resp.choices[0].message.content
 
+# ---- Interview demo UI ----
 mode = st.selectbox(
     "Mode",
     ["Workup/Treatment/Disposition", "Discharge instructions (patient-friendly)"],
     index=0,
 )
 
-question = st.text_input(
-    "What are you trying to figure out?",
-    placeholder="e.g., adult DKA initial management labs insulin potassium",
-)
+samples = [
+    "Chest pain, rule-out ACS with high-sensitivity troponin in the ED",
+    "Suspected pulmonary embolism, when to image vs D-dimer",
+    "Sepsis initial bundle in the ED, antibiotics and fluids",
+    "New-onset atrial fibrillation with RVR, rate vs rhythm and disposition",
+    "DKA initial management, potassium and insulin",
+]
+pick = st.selectbox("Question", ["Custom"] + samples, index=0)
+
+if pick == "Custom":
+    final_q = st.text_input("Custom question", placeholder="Type your ED question here")
+else:
+    final_q = pick
 
 col1, col2 = st.columns(2)
 with col1:
     retmax = st.slider("PubMed hits", 3, 10, 5)
 with col2:
-    run = st.button("Generate answer")
+    run = st.button("Run demo")
 
 if run:
-    if not question.strip():
+    if not (final_q or "").strip():
         st.warning("Type a question first.")
     else:
         with st.spinner("Searching PubMed..."):
-            hits = pubmed_search(question, retmax=retmax)
+            hits = pubmed_search(final_q, retmax=retmax)
 
         st.subheader("Top PubMed results")
         if not hits:
@@ -205,8 +214,8 @@ if run:
         st.subheader("Answer (prototype)")
         with st.spinner("Generating..."):
             try:
-                st.write(generate_answer(question, hits, mode))
+                st.write(generate_answer(final_q, hits, mode))
             except KeyError:
-                st.error("Missing OPENAI_API_KEY in Streamlit Secrets.")
+                st.error("Missing OPENAI_API_KEY or APP_PASSWORD in Streamlit Secrets.")
             except Exception as e:
                 st.error(f"OpenAI error: {e}")
