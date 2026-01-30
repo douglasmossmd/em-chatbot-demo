@@ -1,10 +1,8 @@
 import re
 import requests
 import streamlit as st
-import xml.etree.ElementTree as ET
 from openai import OpenAI
 
-# ---------------- UI / page ----------------
 st.set_page_config(page_title="ED Copilot (Prototype)", layout="centered")
 
 st.title("ED Copilot (Prototype)")
@@ -21,7 +19,7 @@ pw = st.text_input("Passcode", type="password")
 if pw != st.secrets.get("APP_PASSWORD", ""):
     st.stop()
 
-# ---------------- Settings controls ----------------
+# ----- Controls -----
 mode = st.selectbox(
     "Mode",
     ["Workup/Treatment/Disposition", "Discharge instructions (patient-friendly)"],
@@ -30,22 +28,28 @@ mode = st.selectbox(
 
 with st.expander("Retrieval settings", expanded=False):
     retmax = st.slider("PubMed results to pull", 3, 10, 5)
-    abstracts_to_use = st.slider("Abstracts to include in context", 1, 5, 3)
-    max_abstract_chars = st.slider("Max chars per abstract", 400, 2000, 1200, step=100)
 
-colA, colB = st.columns(2)
-with colA:
-    if st.button("Clear chat"):
-        st.session_state["messages"] = []
-        st.session_state["last_evidence"] = None
-        st.rerun()
-with colB:
-    st.caption("Chat persists during this session only.")
+samples = [
+    "Chest pain, rule-out ACS with high-sensitivity troponin in the ED",
+    "Suspected pulmonary embolism, when to image vs D-dimer",
+    "Sepsis initial bundle in the ED, antibiotics and fluids",
+    "New-onset atrial fibrillation with RVR, rate vs rhythm and disposition",
+    "DKA initial management, potassium and insulin",
+]
 
-# ---------------- PubMed helpers ----------------
+col1, col2 = st.columns([2, 1])
+with col1:
+    pick = st.selectbox("Quick prompt", ["Custom"] + samples, index=0)
+with col2:
+    send_sample = st.button("Send", use_container_width=True)
+
+custom_text = ""
+if pick == "Custom":
+    custom_text = st.text_input("Custom question", placeholder="Type your ED question here")
+
+# ----- PubMed helpers (metadata only) -----
 NCBI_ESEARCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 NCBI_ESUMMARY = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
-NCBI_EFETCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 
 STOPWORDS = {
     "adult","peds","pediatric","initial","management","workup","labs","lab","treatment","treatments",
@@ -103,8 +107,7 @@ def pubmed_search(term: str, retmax: int = 5):
         timeout=20,
     )
     r.raise_for_status()
-    pmids = r.json().get("esearchresult", {}).get("idlist", [])
-    return pmids
+    return r.json().get("esearchresult", {}).get("idlist", [])
 
 @st.cache_data(ttl=3600)
 def pubmed_summaries(pmids):
@@ -117,6 +120,7 @@ def pubmed_summaries(pmids):
     )
     r.raise_for_status()
     data = r.json()
+
     out = []
     for pmid in pmids:
         item = data.get("result", {}).get(pmid, {})
@@ -133,84 +137,20 @@ def pubmed_summaries(pmids):
         )
     return out
 
-@st.cache_data(ttl=3600)
-def pubmed_fetch_abstracts(pmids):
-    """
-    Fetch abstracts via EFetch XML. Many entries will have no abstract; we handle that.
-    """
-    if not pmids:
-        return {}
-
-    r = requests.get(
-        NCBI_EFETCH,
-        params={
-            "db": "pubmed",
-            "id": ",".join(pmids),
-            "retmode": "xml",
-        },
-        timeout=30,
-    )
-    r.raise_for_status()
-    xml_text = r.text
-
-    root = ET.fromstring(xml_text)
-    abstracts = {}
-
-    for article in root.findall(".//PubmedArticle"):
-        pmid_el = article.find(".//PMID")
-        if pmid_el is None:
-            continue
-        pmid = pmid_el.text.strip()
-
-        abs_nodes = article.findall(".//Abstract/AbstractText")
-        if not abs_nodes:
-            abstracts[pmid] = ""
-            continue
-
-        parts = []
-        for n in abs_nodes:
-            label = n.attrib.get("Label")
-            text = "".join(n.itertext()).strip()
-            if not text:
-                continue
-            if label:
-                parts.append(f"{label}: {text}")
-            else:
-                parts.append(text)
-        abstracts[pmid] = "\n".join(parts).strip()
-
-    # Ensure every requested PMID has a key
-    for p in pmids:
-        abstracts.setdefault(p, "")
-
-    return abstracts
-
-def build_evidence_block(summaries, abstracts_map, abstracts_to_use=3, max_chars=1200):
-    """
-    Build a compact evidence context: title + PMID + abstract (trimmed).
-    """
-    use = summaries[:abstracts_to_use]
+def build_metadata_context(summaries, max_items=5):
+    use = summaries[:max_items]
     lines = []
     allowed_pmids = []
     for h in use:
-        pmid = h["pmid"]
-        allowed_pmids.append(pmid)
-        abstract = (abstracts_map.get(pmid) or "").strip()
-        if abstract:
-            if len(abstract) > max_chars:
-                abstract = abstract[:max_chars].rstrip() + "…"
-        else:
-            abstract = "(No abstract available via PubMed.)"
-
+        allowed_pmids.append(h["pmid"])
         lines.append(
-            f"PMID {pmid}\nTitle: {h['title']}\nJournal/Year: {h['journal']} ({h['year']})\nAbstract:\n{abstract}\nLink: {h['url']}"
+            f"- {h['title']} ({h['journal']}, {h['year']}). PMID {h['pmid']}. {h['url']}"
         )
-    return "\n\n---\n\n".join(lines), allowed_pmids
+    return "\n".join(lines) if lines else "No PubMed results returned.", allowed_pmids
 
-# ---------------- LLM answer ----------------
-def generate_answer(messages, question: str, evidence_text: str, allowed_pmids, mode: str):
+# ----- LLM -----
+def generate_answer(prior_messages, question: str, meta_context: str, allowed_pmids, mode: str):
     client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
-
     allowed_str = ", ".join(allowed_pmids) if allowed_pmids else "none"
 
     system = (
@@ -222,43 +162,46 @@ def generate_answer(messages, question: str, evidence_text: str, allowed_pmids, 
         "If Allowed PMIDs is not 'none', you MUST cite at least 1 PMID from it."
     )
 
+    pmid_rule = (
+        f"Allowed PMIDs: {allowed_str}\n"
+        "RULE: If Allowed PMIDs is not 'none', end with 'Citations: ' followed by 1–3 PMIDs from Allowed PMIDs.\n"
+        "Do not write 'none' if Allowed PMIDs is not 'none'.\n"
+    )
+
     if mode == "Discharge instructions (patient-friendly)":
         user = f"""User question:
 {question}
 
-Allowed PMIDs: {allowed_str}
+PubMed results (metadata only):
+{meta_context}
 
-Evidence (abstracts):
-{evidence_text}
+{pmid_rule}
 
 Write patient-friendly discharge instructions at about an 8th-grade reading level.
 Include: brief explanation, what to do at home, meds if relevant (general), red flags to return, follow-up.
 Keep it brief.
 End with: "This is not medical advice and is for demo only."
-Then end with: Citations: <1–3 PMIDs from Allowed PMIDs> (required if Allowed PMIDs is not 'none').
 """
         max_tokens = 350
     else:
         user = f"""User question:
 {question}
 
-Allowed PMIDs: {allowed_str}
+PubMed results (metadata only):
+{meta_context}
 
-Evidence (abstracts):
-{evidence_text}
+{pmid_rule}
 
 Output (keep brief):
 - Quick take (max 3 bullets)
 - Workup (labs/imaging) (max 6 bullets)
 - Treatment (max 6 bullets)
 - Disposition (max 4 bullets)
-- Citations: <1–3 PMIDs from Allowed PMIDs> (required if Allowed PMIDs is not 'none')
+- Citations: 1–3 PMIDs (required if Allowed PMIDs is not 'none')
 """
         max_tokens = 450
 
-    # Include prior conversation turns, but keep it light: just the message contents.
-    # Streamlit stores messages as {"role": "user"/"assistant", "content": "..."}.
-    convo = [{"role": "system", "content": system}] + messages + [{"role": "user", "content": user}]
+    convo = [{"role": "system", "content": system}] + prior_messages + [{"role": "user", "content": user}]
 
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -268,65 +211,76 @@ Output (keep brief):
     )
     return resp.choices[0].message.content
 
-# ---------------- Chat state ----------------
+# ----- Chat state -----
 if "messages" not in st.session_state:
     st.session_state["messages"] = []
-if "last_evidence" not in st.session_state:
-    st.session_state["last_evidence"] = None
+if "pending_prompt" not in st.session_state:
+    st.session_state["pending_prompt"] = None
+if "last_hits" not in st.session_state:
+    st.session_state["last_hits"] = None
 
-# Render chat history
+# Clear chat button
+if st.button("Clear chat"):
+    st.session_state["messages"] = []
+    st.session_state["pending_prompt"] = None
+    st.session_state["last_hits"] = None
+    st.rerun()
+
+# If they clicked Send on a sample/custom
+if send_sample:
+    if pick == "Custom":
+        st.session_state["pending_prompt"] = (custom_text or "").strip()
+    else:
+        st.session_state["pending_prompt"] = pick
+
+# Render history
 for m in st.session_state["messages"]:
     with st.chat_message(m["role"]):
         st.write(m["content"])
 
 # Chat input
-prompt = st.chat_input("Ask an ED question (no PHI).")
+typed = st.chat_input("Ask an ED question (no PHI).")
+prompt = (typed or "").strip() if typed else None
+
+# Use pending prompt if set
+if not prompt and st.session_state["pending_prompt"]:
+    prompt = st.session_state["pending_prompt"]
+    st.session_state["pending_prompt"] = None
+
 if prompt:
     st.session_state["messages"].append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.write(prompt)
 
     with st.chat_message("assistant"):
-        with st.spinner("Searching PubMed and fetching abstracts..."):
+        with st.spinner("Searching PubMed..."):
             pmids = pubmed_search(prompt, retmax=retmax)
             summaries = pubmed_summaries(pmids)
-            abstracts_map = pubmed_fetch_abstracts(pmids)
 
-            evidence_text, allowed_pmids = build_evidence_block(
-                summaries,
-                abstracts_map,
-                abstracts_to_use=abstracts_to_use,
-                max_chars=max_abstract_chars,
-            )
+            # show top hits
+            if not summaries:
+                st.write("No PubMed results found. Try fewer words or more general terms.")
+                meta_context, allowed_pmids = "No PubMed results returned.", []
+            else:
+                st.subheader("Top PubMed results")
+                for i, h in enumerate(summaries[:retmax], start=1):
+                    meta = " · ".join([x for x in [h["journal"], h["year"], f"PMID {h['pmid']}"] if x])
+                    st.markdown(f"**{i}. [{h['title'] or '(No title returned)'}]({h['url']})**")
+                    st.caption(meta)
 
-            # Store last evidence for transparency/debug
-            st.session_state["last_evidence"] = {
-                "summaries": summaries,
-                "allowed_pmids": allowed_pmids,
-                "evidence_text": evidence_text,
-            }
+                meta_context, allowed_pmids = build_metadata_context(summaries, max_items=retmax)
 
         with st.spinner("Generating answer..."):
             try:
-                answer = generate_answer(
-                    messages=st.session_state["messages"][-6:-1],  # last few turns only
-                    question=prompt,
-                    evidence_text=evidence_text,
-                    allowed_pmids=allowed_pmids,
-                    mode=mode,
-                )
+                prior = st.session_state["messages"][-6:-1]  # keep it light
+                answer = generate_answer(prior, prompt, meta_context, allowed_pmids, mode)
                 st.write(answer)
 
-                # PMID quick links from answer
                 pmids_in_answer = re.findall(r"\b\d{7,8}\b", answer)
                 pmids_in_answer = list(dict.fromkeys(pmids_in_answer))
                 if pmids_in_answer:
                     st.caption("PMIDs cited:")
                     st.markdown(" ".join([f"[{p}](https://pubmed.ncbi.nlm.nih.gov/{p}/)" for p in pmids_in_answer]))
-
-                # Optional: show what abstracts were fed in
-                with st.expander("Evidence used (abstracts sent to model)", expanded=False):
-                    st.text(evidence_text if evidence_text else "(none)")
 
                 st.session_state["messages"].append({"role": "assistant", "content": answer})
 
